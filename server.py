@@ -1,5 +1,6 @@
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
 import uvicorn
 import httpx
 import os
@@ -48,6 +49,15 @@ async def create_patient(name: str, phone: str, email: str = None, dateOfBirth: 
 # If this is inside 'if __main__', production servers cannot import 'app'.
 app = mcp.sse_app()
 
+
+# Lightweight health endpoint for service checks
+async def health(request):
+    return JSONResponse({"status": "ok"})
+
+
+app.add_route("/health", health, methods=["GET"])
+
+
 # CORS Middleware must be attached to the global app instance
 app.add_middleware(
     CORSMiddleware,
@@ -57,6 +67,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 # --- PRODUCTION FIX ENDS HERE ---
+
 
 if __name__ == "__main__":
     import sys
