@@ -1,14 +1,16 @@
 from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse, PlainTextResponse, RedirectResponse
+from starlette.routing import Mount, Route
 import uvicorn
 import httpx
 import os
 
 # Initialize FastMCP server
-# We set the host to 0.0.0.0 to make it accessible externally
-# Render sets the PORT environment variable, so we need to use it.
+# Render/Cloud Run set the PORT environment variable.
 port = int(os.environ.get("PORT", 8000))
-mcp = FastMCP("healthco-mcp", host="0.0.0.0", port=port)
+mcp = FastMCP("healthco-mcp")
 
 @mcp.tool()
 async def create_patient(name: str, phone: str, secretKey: str, email: str = None, dateOfBirth: str = None) -> str:
@@ -45,22 +47,72 @@ async def create_patient(name: str, phone: str, secretKey: str, email: str = Non
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "stdio":
+    arg_transport = sys.argv[1].lower() if len(sys.argv) > 1 else None
+
+    # Modes:
+    # - stdio: local VS Code MCP (spawned process)
+    # - sse: legacy HTTP+SSE (endpoint at /sse)
+    # - streamable-http: recommended for remote deployments (endpoint at /mcp)
+    if arg_transport == "stdio":
         mcp.run(transport="stdio")
-    else:
-        # Run the server using SSE transport
-        print(f"Starting MCP server on http://0.0.0.0:{port}")
-        
-        # Get the underlying Starlette app
-        app = mcp.sse_app()
-        
-        # Add CORS middleware to allow Retell AI (and others) to connect
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+        raise SystemExit(0)
+
+    transport = (arg_transport or os.environ.get("MCP_TRANSPORT") or "streamable-http").lower()
+    if transport in {"http", "streamable", "streamablehttp"}:
+        transport = "streamable-http"
+
+    if transport not in {"sse", "streamable-http"}:
+        raise SystemExit(
+            "Invalid transport. Use one of: stdio | sse | streamable-http (default)."
         )
-        
-        uvicorn.run(app, host="0.0.0.0", port=port)
+
+    # Build the MCP ASGI app and mount it at a stable path.
+    # VS Code 'type: http' works best with streamable-http at /mcp.
+    if transport == "streamable-http":
+        mcp_asgi = mcp.streamable_http_app()
+        mount_path = os.environ.get("MCP_MOUNT_PATH", "/mcp")
+    else:
+        mcp_asgi = mcp.sse_app()
+        mount_path = os.environ.get("MCP_MOUNT_PATH", "/")
+
+    if not mount_path.startswith("/"):
+        mount_path = f"/{mount_path}"
+
+    async def health(_: object) -> JSONResponse:
+        return JSONResponse({"status": "ok", "transport": transport, "mount": mount_path})
+
+    async def index(_: object):
+        if transport == "streamable-http":
+            return RedirectResponse(url=f"{mount_path}")
+        return PlainTextResponse("MCP server is running. SSE endpoint is at /sse")
+
+    app = Starlette(
+        routes=[
+            Route("/health", health, methods=["GET"]),
+            Route("/", index, methods=["GET"]),
+            Mount(mount_path, app=mcp_asgi),
+        ]
+    )
+
+    # CORS is mainly relevant for browser-based clients.
+    # If you truly need credentialed requests, set MCP_CORS_ORIGINS to a comma-separated allowlist.
+    cors_origins = os.environ.get("MCP_CORS_ORIGINS", "*")
+    allow_origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
+    allow_credentials = os.environ.get("MCP_CORS_ALLOW_CREDENTIALS", "false").lower() == "true"
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allow_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"] ,
+        allow_headers=["*"],
+    )
+
+    print(f"Starting MCP server on http://0.0.0.0:{port} ({transport} at {mount_path})")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
