@@ -1,8 +1,7 @@
 from mcp.server.fastmcp import FastMCP
-from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse, PlainTextResponse, RedirectResponse
-from starlette.routing import Mount, Route
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
 import uvicorn
 import httpx
 import os
@@ -10,7 +9,19 @@ import os
 # Initialize FastMCP server
 # Render/Cloud Run set the PORT environment variable.
 port = int(os.environ.get("PORT", 8000))
-mcp = FastMCP("healthco-mcp")
+mcp = FastMCP("healthco-mcp", host="0.0.0.0", port=port)
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(_: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "name": mcp.name})
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def index(_: Request) -> PlainTextResponse:
+    return PlainTextResponse(
+        "MCP server is running. Streamable HTTP endpoint: /mcp"
+    )
 
 @mcp.tool()
 async def create_patient(name: str, phone: str, secretKey: str, email: str = None, dateOfBirth: str = None) -> str:
@@ -51,48 +62,14 @@ if __name__ == "__main__":
 
     # Modes:
     # - stdio: local VS Code MCP (spawned process)
-    # - sse: legacy HTTP+SSE (endpoint at /sse)
-    # - streamable-http: recommended for remote deployments (endpoint at /mcp)
+    # - streamable-http: remote deployments (endpoint at /mcp)
     if arg_transport == "stdio":
         mcp.run(transport="stdio")
         raise SystemExit(0)
 
-    transport = (arg_transport or os.environ.get("MCP_TRANSPORT") or "streamable-http").lower()
-    if transport in {"http", "streamable", "streamablehttp"}:
-        transport = "streamable-http"
-
-    if transport not in {"sse", "streamable-http"}:
-        raise SystemExit(
-            "Invalid transport. Use one of: stdio | sse | streamable-http (default)."
-        )
-
-    # Build the MCP ASGI app and mount it at a stable path.
-    # VS Code 'type: http' works best with streamable-http at /mcp.
-    if transport == "streamable-http":
-        mcp_asgi = mcp.streamable_http_app()
-        mount_path = os.environ.get("MCP_MOUNT_PATH", "/mcp")
-    else:
-        mcp_asgi = mcp.sse_app()
-        mount_path = os.environ.get("MCP_MOUNT_PATH", "/")
-
-    if not mount_path.startswith("/"):
-        mount_path = f"/{mount_path}"
-
-    async def health(_: object) -> JSONResponse:
-        return JSONResponse({"status": "ok", "transport": transport, "mount": mount_path})
-
-    async def index(_: object):
-        if transport == "streamable-http":
-            return RedirectResponse(url=f"{mount_path}")
-        return PlainTextResponse("MCP server is running. SSE endpoint is at /sse")
-
-    app = Starlette(
-        routes=[
-            Route("/health", health, methods=["GET"]),
-            Route("/", index, methods=["GET"]),
-            Mount(mount_path, app=mcp_asgi),
-        ]
-    )
+    # Always serve MCP over Streamable HTTP for deployments.
+    # Endpoint is /mcp (FastMCP default).
+    app = mcp.streamable_http_app()
 
     # CORS is mainly relevant for browser-based clients.
     # If you truly need credentialed requests, set MCP_CORS_ORIGINS to a comma-separated allowlist.
@@ -104,11 +81,11 @@ if __name__ == "__main__":
         CORSMiddleware,
         allow_origins=allow_origins,
         allow_credentials=allow_credentials,
-        allow_methods=["*"] ,
+        allow_methods=["*"],
         allow_headers=["*"],
     )
 
-    print(f"Starting MCP server on http://0.0.0.0:{port} ({transport} at {mount_path})")
+    print(f"Starting MCP server on http://0.0.0.0:{port} (streamable-http)")
     uvicorn.run(
         app,
         host="0.0.0.0",
